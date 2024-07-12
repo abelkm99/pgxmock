@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strconv"
 
 	pgx "github.com/jackc/pgx/v5"
 	pgconn "github.com/jackc/pgx/v5/pgconn"
@@ -98,6 +99,8 @@ type Expecter interface {
 
 	// New Column allows to create a Column
 	NewColumn(name string) *pgconn.FieldDescription
+
+	ExpectBatch() *ExpectBatch
 }
 
 // PgxCommonIface represents common interface for all pgx connection interfaces:
@@ -157,26 +160,35 @@ func (c *pgxmock) MatchExpectationsInOrder(b bool) {
 }
 
 func (c *pgxmock) ExpectationsWereMet() error {
-	for _, e := range c.expectations {
-		e.Lock()
-		fulfilled := e.fulfilled() || !e.required()
-		e.Unlock()
+	for _, exp := range c.expectations {
+		for idx, e := range exp.expand() {
+			e.Lock()
+			fulfilled := e.fulfilled() || !e.required()
+			e.Unlock()
 
-		if !fulfilled {
-			return fmt.Errorf("there is a remaining expectation which was not matched: %s", e)
-		}
+			// check if the parrent is batch expectation
+			err_message := "there is a remaining EXPECRATION which was not matched: %s"
 
-		// for expected prepared statement check whether it was closed if expected
-		if prep, ok := e.(*ExpectedPrepare); ok {
-			if prep.mustBeClosed && !prep.deallocated {
-				return fmt.Errorf("expected prepared statement to be closed, but it was not: %s", prep)
+			if !fulfilled {
+				// if error exists check if the error is BATCH Expectations. for cleaner and undersandable error message
+				if _, ok := exp.(*ExpectBatch); ok {
+					err_message = "there is a remaining BATCH expectation at index " + strconv.Itoa(idx) + " which was not matched: %s"
+				}
+				return fmt.Errorf(err_message, e)
 			}
-		}
 
-		// must check whether all expected queried rows are closed
-		if query, ok := e.(*ExpectedQuery); ok {
-			if query.rowsMustBeClosed && !query.rowsWereClosed {
-				return fmt.Errorf("expected query rows to be closed, but it was not: %s", query)
+			// for expected prepared statement check whether it was closed if expected
+			if prep, ok := e.(*ExpectedPrepare); ok {
+				if prep.mustBeClosed && !prep.deallocated {
+					return fmt.Errorf("expected prepared statement to be closed, but it was not: %s", prep)
+				}
+			}
+
+			// must check whether all expected queried rows are closed
+			if query, ok := e.(*ExpectedQuery); ok {
+				if query.rowsMustBeClosed && !query.rowsWereClosed {
+					return fmt.Errorf("expected query rows to be closed, but it was not: %s", query)
+				}
 			}
 		}
 	}
@@ -210,6 +222,12 @@ func (c *pgxmock) ExpectBegin() *ExpectedBegin {
 
 func (c *pgxmock) ExpectBeginTx(txOptions pgx.TxOptions) *ExpectedBegin {
 	e := &ExpectedBegin{opts: txOptions}
+	c.expectations = append(c.expectations, e)
+	return e
+}
+
+func (c *pgxmock) ExpectBatch() *ExpectBatch {
+	e := &ExpectBatch{}
 	c.expectations = append(c.expectations, e)
 	return e
 }
@@ -323,8 +341,12 @@ func (c *pgxmock) CopyFrom(ctx context.Context, tableName pgx.Identifier, column
 	return ex.rowsAffected, ex.waitForDelay(ctx)
 }
 
-func (c *pgxmock) SendBatch(context.Context, *pgx.Batch) pgx.BatchResults {
-	return nil
+func (c *pgxmock) SendBatch(ctx context.Context, batch *pgx.Batch) pgx.BatchResults {
+	return &mockBatchResults{
+		ctx:   ctx,
+		mock:  c,
+		batch: batch,
+	}
 }
 
 func (c *pgxmock) LargeObjects() pgx.LargeObjects {
@@ -498,32 +520,39 @@ func findExpectationFunc[ET expectationType[t], t any](c *pgxmock, method string
 	var fulfilled int
 	var ok bool
 	var err error
-	for _, next := range c.expectations {
-		next.Lock()
-		if next.fulfilled() {
-			next.Unlock()
-			fulfilled++
-			continue
-		}
-
-		if expected, ok = next.(ET); ok {
-			err = cmp(expected)
-			if err == nil {
-				break
-			}
-		}
-		if c.ordered {
-			if (!ok || err != nil) && !next.required() {
+	for _, exp := range c.expectations {
+		found := false
+		for _, next := range exp.expand() {
+			next.Lock()
+			if next.fulfilled() {
 				next.Unlock()
+				fulfilled++
 				continue
 			}
-			next.Unlock()
-			if err != nil {
-				return nil, err
+
+			if expected, ok = next.(ET); ok {
+				err = cmp(expected)
+				if err == nil {
+					found = true
+					break
+				}
 			}
-			return nil, fmt.Errorf("call to method %s, was not expected, next expectation is: %s", method, next)
+			if c.ordered {
+				if (!ok || err != nil) && !next.required() {
+					next.Unlock()
+					continue
+				}
+				next.Unlock()
+				if err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("call to method %s, was not expected, next expectation is: %s", method, next)
+			}
+			next.Unlock()
 		}
-		next.Unlock()
+		if found {
+			break
+		}
 	}
 
 	if expected == nil {
@@ -541,4 +570,47 @@ func findExpectationFunc[ET expectationType[t], t any](c *pgxmock, method string
 
 func findExpectation[ET expectationType[t], t any](c *pgxmock, method string) (ET, error) {
 	return findExpectationFunc[ET, t](c, method, func(_ ET) error { return nil })
+}
+
+type mockBatchResults struct {
+	ctx   context.Context
+	mock  *pgxmock
+	batch *pgx.Batch
+	qqIdx int
+}
+
+func (br *mockBatchResults) Exec() (pgconn.CommandTag, error) {
+	query, args, _ := br.nextQueryAndArgs()
+	return br.mock.Exec(br.ctx, query, args...)
+}
+
+func (br *mockBatchResults) Query() (pgx.Rows, error) {
+	query, args, ok := br.nextQueryAndArgs()
+	if !ok {
+		return nil, fmt.Errorf("no more queries in the batch")
+	}
+
+	return br.mock.Query(br.ctx, query, args...)
+
+}
+
+func (br *mockBatchResults) QueryRow() pgx.Row {
+	rows, _ := br.Query()
+	rows.Next()
+	return rows
+}
+
+func (br *mockBatchResults) Close() error {
+	return nil
+}
+
+func (br *mockBatchResults) nextQueryAndArgs() (query string, args []any, ok bool) {
+	if br.batch != nil && br.qqIdx < len(br.batch.QueuedQueries) {
+		bi := br.batch.QueuedQueries[br.qqIdx]
+		query = bi.SQL
+		args = bi.Arguments
+		ok = true
+		br.qqIdx++
+	}
+	return
 }

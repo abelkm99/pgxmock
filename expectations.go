@@ -19,6 +19,7 @@ type expectation interface {
 	required() bool
 	fulfilled() bool
 	fulfill()
+	expand() []expectation
 	sync.Locker
 	fmt.Stringer
 }
@@ -52,6 +53,9 @@ type commonExpectation struct {
 	plannedCalls  uint          // how many sequentional calls should be made
 }
 
+func (e *commonExpectation) expand() []expectation {
+	return []expectation{e}
+}
 func (e *commonExpectation) error() error {
 	return e.err
 }
@@ -179,6 +183,10 @@ type ExpectedClose struct {
 	commonExpectation
 }
 
+func (e *ExpectedClose) expand() []expectation {
+	return []expectation{e}
+}
+
 // String returns string representation
 func (e *ExpectedClose) String() string {
 	return "ExpectedClose => expecting call to Close()\n" + e.commonExpectation.String()
@@ -189,6 +197,10 @@ func (e *ExpectedClose) String() string {
 type ExpectedBegin struct {
 	commonExpectation
 	opts pgx.TxOptions
+}
+
+func (e *ExpectedBegin) expand() []expectation {
+	return []expectation{e}
 }
 
 // String returns string representation
@@ -206,6 +218,10 @@ type ExpectedCommit struct {
 	commonExpectation
 }
 
+func (e *ExpectedCommit) expand() []expectation {
+	return []expectation{e}
+}
+
 // String returns string representation
 func (e *ExpectedCommit) String() string {
 	return "ExpectedCommit => expecting call to Tx.Commit()\n" + e.commonExpectation.String()
@@ -217,6 +233,10 @@ type ExpectedExec struct {
 	commonExpectation
 	queryBasedExpectation
 	result pgconn.CommandTag
+}
+
+func (e *ExpectedExec) expand() []expectation {
+	return []expectation{e}
 }
 
 // WithArgs will match given expected args to actual database exec operation arguments.
@@ -274,6 +294,10 @@ type ExpectedPrepare struct {
 	deallocated    bool
 }
 
+func (e *ExpectedPrepare) expand() []expectation {
+	return []expectation{e}
+}
+
 // WillReturnCloseError allows to set an error for this prepared statement Close action
 func (e *ExpectedPrepare) WillReturnCloseError(err error) *ExpectedPrepare {
 	e.deallocateErr = err
@@ -327,6 +351,10 @@ type ExpectedPing struct {
 	commonExpectation
 }
 
+func (e *ExpectedPing) expand() []expectation {
+	return []expectation{e}
+}
+
 // String returns string representation
 func (e *ExpectedPing) String() string {
 	msg := "ExpectedPing => expecting call to Ping()\n"
@@ -341,6 +369,10 @@ type ExpectedQuery struct {
 	rows             pgx.Rows
 	rowsMustBeClosed bool
 	rowsWereClosed   bool
+}
+
+func (e *ExpectedQuery) expand() []expectation {
+	return []expectation{e}
 }
 
 // WithArgs will match given expected args to actual database query arguments.
@@ -399,6 +431,10 @@ type ExpectedCopyFrom struct {
 	rowsAffected      int64
 }
 
+func (e *ExpectedCopyFrom) expand() []expectation {
+	return []expectation{e}
+}
+
 // String returns string representation
 func (e *ExpectedCopyFrom) String() string {
 	msg := "ExpectedCopyFrom => expecting CopyFrom which:"
@@ -423,6 +459,10 @@ type ExpectedReset struct {
 	commonExpectation
 }
 
+func (e *ExpectedReset) expand() []expectation {
+	return []expectation{e}
+}
+
 func (e *ExpectedReset) String() string {
 	return "ExpectedReset => expecting database Reset"
 }
@@ -433,6 +473,10 @@ type ExpectedRollback struct {
 	commonExpectation
 }
 
+func (e *ExpectedRollback) expand() []expectation {
+	return []expectation{e}
+}
+
 // String returns string representation
 func (e *ExpectedRollback) String() string {
 	msg := "ExpectedRollback => expecting transaction Rollback"
@@ -440,4 +484,35 @@ func (e *ExpectedRollback) String() string {
 		msg += fmt.Sprintf(", which should return error: %s", e.err)
 	}
 	return msg
+}
+
+type ExpectBatch struct {
+	commonExpectation
+	complete          bool
+	batchExpectations []expectation
+}
+
+func (e *ExpectBatch) String() string {
+	msg := "ExpectBatch => expecting call to SendBatch()"
+	for _, ex := range e.batchExpectations {
+		msg += fmt.Sprintf("\n%s", ex)
+	}
+	return msg
+}
+
+func (e *ExpectBatch) AddExpectExec(expectedSQL string) *ExpectedExec {
+	expectedExec := &ExpectedExec{}
+	expectedExec.expectSQL = expectedSQL
+	e.batchExpectations = append(e.batchExpectations, expectedExec)
+	return expectedExec
+}
+
+func (e *ExpectBatch) AddExpectQuery(expectedSQL string) *ExpectedQuery {
+	expectedQuery := &ExpectedQuery{}
+	expectedQuery.expectSQL = expectedSQL
+	e.batchExpectations = append(e.batchExpectations, expectedQuery)
+	return expectedQuery
+}
+func (e *ExpectBatch) expand() []expectation {
+	return e.batchExpectations
 }
